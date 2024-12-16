@@ -1304,6 +1304,8 @@ class AbsTask(ABC):
                 processes.append(process)
                 error_files.append(tf.name)
             # Loop on join until it returns True or raises an exception.
+            print(processes)
+            print(error_files)
             while not ProcessContext(processes, error_files).join():
                 pass
 

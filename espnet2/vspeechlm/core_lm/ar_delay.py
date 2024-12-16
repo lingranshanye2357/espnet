@@ -10,9 +10,9 @@ from typing import Dict, Tuple
 
 import torch
 
-from espnet2.speechlm.core_lm.abs_core_lm import SpeechLMInferenceOptions
-from espnet2.speechlm.core_lm.ar_parallel import ARParallelLM
-from espnet2.speechlm.net_utils import (
+from espnet2.vspeechlm.core_lm.abs_core_lm import VSpeechLMInferenceOptions
+from espnet2.vspeechlm.core_lm.ar_parallel import ARParallelLM
+from espnet2.vspeechlm.net_utils import (
     logits_to_tokens,
     beam_search_selection,
     modality_index_to_mask,
@@ -81,7 +81,7 @@ class ARDelayLM(ARParallelLM):
     def inference(
         self,
         prefix: torch.Tensor,
-        opts: SpeechLMInferenceOptions,
+        opts: VSpeechLMInferenceOptions,
         conti_feats = None,
         suffix: torch.Tensor = None,
         inference_length: int = -1,
@@ -90,7 +90,7 @@ class ARDelayLM(ARParallelLM):
 
         Args:
             prefix (LongTensor): Prefix part of dec_seq (B, T, nq).
-            opts (SpeechLMInferenceOptions): inference options.
+            opts (VSpeechLMInferenceOptions): inference options.
             conti_feats: continuous features.
             suffix (LongTensor): suffix part of dec_seq (B, T, nq),
                 usually the target sequence for teacher-forcing.

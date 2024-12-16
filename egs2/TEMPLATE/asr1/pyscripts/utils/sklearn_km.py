@@ -15,13 +15,14 @@ import warnings
 from random import sample
 
 import fairseq
+import kaldiio
 import joblib
 import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
 import tqdm
-from feature_loader import HubertFeatureReader, MfccFeatureReader
+# from feature_loader import HubertFeatureReader, MfccFeatureReader
 from sklearn.cluster import MiniBatchKMeans
 
 from espnet2.asr.encoder.hubert_encoder import FairseqHubertEncoder
@@ -110,6 +111,15 @@ def get_hubert_feature(feats_dir, fs, portion, url, dir, layer):
     logger.info("Getting HuBERT feature successfully")
     return np.vstack(feats)
 
+def get_avhubert_feature(feats_dir, portion):
+    feats = []
+    with kaldiio.ReadHelper(feats_dir) as reader:
+        for key, numpy_array in reader:
+            feats.append(numpy_array)
+    np.random.shuffle(feats)
+    feats = feats[:int(portion * len(feats))]
+    logger.info("Getting AVHuBERT feature successfully")
+    return np.vstack(feats)
 
 def load_feature(
     feats_dir,
@@ -121,7 +131,9 @@ def load_feature(
     hubert_model_path,
 ):
     # generate mfcc feature
-    if feature_type == "mfcc":
+    if feature_type == 'avhubert':
+        feat = get_avhubert_feature(feats_dir, portion)
+    elif feature_type == "mfcc":
         feat = get_mfcc_feature(feats_dir, fs, nj, portion)
     elif "hubert" in feature_type:
         hlayer = int(feature_type.replace("hubert", ""))

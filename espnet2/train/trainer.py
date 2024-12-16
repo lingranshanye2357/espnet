@@ -290,6 +290,7 @@ class Trainer:
                         else None
                     ),
                     find_unused_parameters=trainer_options.unused_parameters,
+                    # find_unused_parameters=True,
                 )
 
         elif distributed_option.ngpu > 1:

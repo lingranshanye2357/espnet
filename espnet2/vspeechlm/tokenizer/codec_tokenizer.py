@@ -6,7 +6,7 @@
 import numpy as np
 import torch
 
-from espnet2.speechlm.tokenizer.abs_tokenizer import AbsTokenizer
+from espnet2.vspeechlm.tokenizer.abs_tokenizer import AbsTokenizer
 
 
 class CodecTokenizer(AbsTokenizer):
@@ -18,7 +18,7 @@ class CodecTokenizer(AbsTokenizer):
           (de)tokenization
         - use forward and detokenization for discrete (de)tokenization
           with flatten sequence style, which is more friendly for
-          speechlm task
+          vspeechlm task
     """
 
     def __init__(
@@ -335,7 +335,7 @@ if __name__ == "__main__":
         resyn_audio2 = resyn_audio2[0].cpu().numpy()
         sf.write("resyn2.wav", resyn_audio2, sr)
 
-        # high level API for speechlm
+        # high level API for vspeechlm
         flatten_codes, _ = codec(waveform)
         print(f"flatten_codes", flatten_codes.size())
         resyn_audio3 = codec.detokenize(flatten_codes)

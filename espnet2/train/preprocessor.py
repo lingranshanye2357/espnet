@@ -15,6 +15,7 @@ import soundfile
 from typeguard import typechecked
 
 import espnet2.speechlm.definitions as speechlm_definitions
+import espnet2.vspeechlm.definitions as vspeechlm_definitions
 from espnet2.layers.augmentation import DataAugmentation
 from espnet2.text.build_tokenizer import build_tokenizer
 from espnet2.text.cleaner import TextCleaner
@@ -2709,6 +2710,406 @@ class SpeechLMPreprocessor(AbsPreprocessor):
 
         # continuous modalities
         elif modality in ["text_emb"]:
+            if value.ndim != 2:
+                raise ValueError(f"Text embedding should have size of [T, D]")
+
+            conti_emb = value.copy()
+
+            value = self.special_token(f"<pad>")
+            # NOTE(Jinchuan) add extra paddings of (self.codec_token_in_use - 1) so there
+            # is no overlap between tokens and continuous embeddings when using
+            # delay interleave.
+            value_len = conti_emb.shape[0] + self.codec_token_in_use - 1
+            value = np.tile(value, value_len)
+
+            # embedidngs, start, end
+            conti_feat = (
+                conti_emb,
+                self.codec_token_in_use,
+                self.codec_token_in_use + conti_emb.shape[0],
+            )
+
+        else:
+            raise NotImplementedError
+    
+        if modality in ["codec", "ssl", "codec_ssl"] and "asr" in cache["task_name"] and self.asr_apply_time_mask and self.train:
+            value = np.expand_dims(value, axis=0)
+            value, _ = self.asr_time_mask(value)
+            value = np.squeeze(value, axis=0)
+        
+        value = value.flatten()
+        modality_idx = self.special_token(f"<{modality}_start/end>")
+        value = np.concatenate([modality_idx, value]).astype(np.int64)
+
+        return value, conti_feat
+
+    def diagnose(self, data):
+        """Only for debug"""
+        enc_seq = data.get("enc_seq", None)
+        dec_seq = data.get("dec_seq", None)
+        sampled_seq = data.get("sampled_seq", None)
+        prefix_len = data.get("prefix_len")
+
+        logging.warning(f"Diagnose in preprocessor ...")
+        logging.warning(f"Prefix length: {prefix_len}")
+        for name, seq in [
+            ("encoder", enc_seq),
+            ("decoder", dec_seq),
+            ("sampled_seq", sampled_seq),
+        ]:
+            if seq is None:
+                continue
+            logging.warning(f"{name} ...")
+            for idx, patch in enumerate(seq):
+                patch = patch.tolist()
+                patch_str = ", ".join(self.converter.ids2tokens(patch))
+                logging.warning(f"Patch: {idx} -> {patch_str}")
+
+        conti_feats = data.get("conti_feats")
+        for idx, conti_feat in enumerate(conti_feats):
+            conti_emb, start, end, part = conti_feat
+            assert len(conti_emb) == end - start
+            logging.warning(f"{idx}-th conti feats on {part}, range [{start}, {end})")
+
+        raise ValueError("End of Diagnose")
+
+
+class VSpeechLMPreprocessor(AbsPreprocessor):
+    """Preprocessor specifically for SpeechLM models"""
+
+    @typechecked
+    def __init__(
+        self,
+        token_list: List,
+        token_bias: Dict,
+        train: bool = True,
+        encoder_decoder_format: Optional[bool] = False,
+        # codec related:
+        codec_token_per_frame: int = 1,
+        codec_token_in_use: Optional[int] = None,
+        # codec_ssl related:
+        codec_ssl_corrupt_prob: float = 0.0,
+        # tokenizer related: Phone & BPE
+        unk_symbol: Optional[str] = "<unk>",
+        space_symbol: Optional[str] = "<space>",
+        non_linguistic_symbols: Optional[Union[Path, str, Iterable[str]]] = None,
+        g2p_type: Optional[str] = None,
+        subword_model: Optional[Union[Path, str, Iterable[str]]] = None,
+        subword_model_type: str = "sentencepiece",
+        bpe_encode_kwargs: Optional[Dict] = None,
+        text_cleaner: Optional[str] = None,
+        # speaker prompt
+        speaker_prompt_length: int = 500,
+        pad_speaker_prompt: bool = True,
+        # others
+        n_ctx: int = 4096,
+        inter_segment_pad: int = 0,
+        extra_names_and_modalities=[
+            "sampled.scp,codec",
+        ],
+        asr_apply_time_mask: bool = False,
+        asr_time_mask_config: dict = dict(),
+    ):
+        self.token_list = token_list.copy()
+        self.token_bias = token_bias.copy()
+        self.train = train
+        self.encoder_decoder_format = encoder_decoder_format
+        self.n_ctx = n_ctx - codec_token_in_use  # in case this is delay interleave
+        self.inter_segment_pad = inter_segment_pad
+        self.pad = token_list.index("<pad>")
+        self.unk = token_list.index("<unk>")
+
+        assert not (
+            "codec" in token_bias and "codec_ssl" in token_bias
+        ), "Cannot use both modality codec and codec_ssl"
+
+        self.modalities = vspeechlm_definitions.MODALITIES
+        self.tasks = vspeechlm_definitions.SPEECHLM_TASKS
+
+        self.converter = TokenIDConverter(
+            token_list=token_list,
+            unk_symbol=unk_symbol,
+        )
+        self.text_cleaner = TextCleaner(text_cleaner)
+
+        ### Modality-specific utilities
+
+        # Text BPE (text_bpe):
+        if subword_model is not None:
+            if bpe_encode_kwargs is None:
+                bpe_encode_kwargs = dict()
+            if subword_model_type == "sentencepiece":
+                self.bpe = build_tokenizer(
+                    token_type="bpe",
+                    bpemodel=subword_model + ".model",
+                    encode_kwargs=bpe_encode_kwargs,
+                )
+            else:
+                self.bpe = build_tokenizer(
+                    token_type="hugging_face",
+                    bpemodel=subword_model,
+                )
+        else:
+            self.bpe = None
+
+        # Phones (g2p):
+        if g2p_type is not None:
+            self.g2p = build_tokenizer(
+                token_type="phn",
+                space_symbol=space_symbol,
+                non_linguistic_symbols=non_linguistic_symbols,
+                g2p_type=g2p_type,
+            )
+        else:
+            self.g2p = None
+
+        # Codec model (codec):
+        self.codec_token_per_frame = codec_token_per_frame
+        if codec_token_in_use is None:
+            codec_token_in_use = codec_token_per_frame
+            assert codec_token_in_use <= codec_token_per_frame
+        self.codec_token_in_use = codec_token_in_use
+
+        # Codec ssl
+        self.codec_ssl_corrupt_prob = codec_ssl_corrupt_prob
+
+        # speaker prompt
+        self.speaker_prompt_length = speaker_prompt_length
+        self.pad_speaker_prompt = pad_speaker_prompt
+
+        # extra entries
+        self.extra_names_and_modalities = [
+            tup.split(",") for tup in extra_names_and_modalities
+        ]
+
+        # time-mask, or specaug:
+        self.asr_apply_time_mask = asr_apply_time_mask
+        if asr_apply_time_mask and train:
+            from espnet2.layers.mask_along_axis import MaskAlongAxisVariableMaxWidth
+            self.asr_time_mask=MaskAlongAxisVariableMaxWidth(**asr_time_mask_config)
+        else:
+            self.asr_time_mask = None
+
+    @typechecked
+    def __call__(
+        self, uid: str, data: Dict[str, Union[str, np.ndarray]]
+    ) -> Dict[str, Union[np.ndarray, List]]:
+        new_data = {}
+
+        # (1) task parsing
+        task_name = uid.strip().split(" ")[0]
+        task = self.tasks[task_name]
+
+        # (2) get exact tokenized value based on all data triplets
+        seqs, conti_feats = [], []
+        
+        cache = {triplet[:2]: None for triplet in task.data_triplets}   # 这里什么意思
+        cache["task_name"] = task_name
+
+        inference_length = -1
+        for idx, triplet in enumerate(task.data_triplets):
+            name, modality, _type = triplet
+
+            value, conti_feat = self.modality_specific_processing(
+                data[name], 
+                modality,
+                cache,
+                uid
+            )
+
+            if name == task.fixed_length_key:
+                inference_length = value.shape[0] / self.codec_token_in_use
+
+            if idx != len(task.data_triplets) - 1  and self.inter_segment_pad > 0:
+                pad = np.tile(self.special_token("<pad>"), self.inter_segment_pad)
+                value = np.concatenate([value, pad], axis=0)
+
+            cache[(name, modality)] = value
+            seqs.append(value)
+
+            if triplet in task.targets and conti_feat is not None:
+                raise ValueError("Continuous feats can only be the condition")
+            conti_feats.append(conti_feat)
+        
+        # used for fixed-length inference.
+        new_data["inference_length"] = np.array([inference_length]).astype(np.int64)
+
+        # (3) splice
+        sos_eos = self.special_token("<sos/eos>")
+        if task.use_task_identifier:
+            task_identifier = f"<{task_name}_task>"
+        else:
+            task_identifier = "<unkown_task_identifer>"
+        task_identifier = self.special_token(task_identifier)
+
+        n_conditions = len(task.conditions)
+        if self.encoder_decoder_format:
+            new_data["enc_seq"] = np.concatenate(
+                [sos_eos] + [task_identifier] + seqs[:n_conditions] + [sos_eos], axis=0
+            ).reshape(-1, self.codec_token_in_use)[: self.n_ctx]
+            new_data["dec_seq"] = np.concatenate(
+                [sos_eos] + seqs[n_conditions:] + [sos_eos], axis=0
+            ).reshape(-1, self.codec_token_in_use)[: self.n_ctx]
+        else:
+            new_data["dec_seq"] = np.concatenate(
+                [sos_eos] + [task_identifier] + seqs + [sos_eos], axis=0
+            ).reshape(-1, self.codec_token_in_use)[: self.n_ctx]
+        
+        if np.isin(self.unk, new_data["dec_seq"]):
+            raise ValueError(f"Unknown token is in the decoder seq. UID: {uid}")
+
+        prefix_len = sum([len(seq) for seq in seqs[:n_conditions]])
+        prefix_len = prefix_len // self.codec_token_in_use + 2
+        new_data["prefix_len"] = np.array([prefix_len])
+
+        # (4) continuous features
+        new_conti_feats = []
+        for idx, conti_feat in enumerate(conti_feats, 1):
+            if conti_feat is None:
+                continue
+
+            if self.encoder_decoder_format:
+                raise NotImplementedError
+            else:
+                prev_segs = [sos_eos] + [task_identifier] + seqs[: idx - 1]
+
+            bias = sum(len(seg) for seg in prev_segs) // self.codec_token_in_use
+            conti_emb, start, end = conti_feat
+            new_conti_feats.append((conti_emb, start + bias, end + bias))
+        new_data["conti_feats"] = new_conti_feats
+
+        # (5) entries that are not included in sequences
+        for name, modality in self.extra_names_and_modalities:
+            if name not in data:
+                continue
+
+            # Currently it's not under good maintainance.
+            raise NotImplementedError
+            value = self.modality_specific_processing(data[name], modality)[0]
+            new_data = self.process_extra_entries(new_data, value, name)
+
+        # self.diagnose(new_data) # For debug. Enable this to check the sequence format
+
+        return new_data
+
+    def process_extra_entries(self, new_data, value, name):
+        # Used in DPO: find the negative examples
+        if name == "sampled.scp":
+            prefix_len = new_data["prefix_len"]
+            prefix = new_data["dec_seq"][: prefix_len.item()]
+            sampled_seq = np.concatenate(
+                [
+                    prefix.flatten(),
+                    value,
+                    self.special_token("<sos/eos>"),
+                ]
+            ).reshape(-1, self.codec_token_in_use)
+
+            max_len = int(len(new_data["dec_seq"]) * 1.3)  # to avoid overly long seq
+            new_data["sampled_seq"] = sampled_seq[:max_len]
+        else:
+            raise NotImplementedError
+
+        return new_data
+
+    def special_token(self, token):
+        token_idx = self.token_list.index(token)
+        token_idx = np.array([token_idx])
+        token_idx = np.pad(
+            token_idx, 
+            (0, self.codec_token_in_use - 1), 
+            mode="constant", 
+            constant_values=self.pad
+        )
+        return token_idx
+
+    def modality_specific_processing(self, value, modality, cache, uid):
+        # multi-stream discrete modalities
+        if modality in ["codec", "spk", "codec_ssl"]:
+            value = value.reshape(-1, self.codec_token_per_frame)
+            value = value[:, :self.codec_token_in_use]
+
+            if modality == "spk":
+                all_modalities = [x[1] for x in cache.keys()]
+                if not (("codec" in all_modalities) ^ ("codec_ssl" in all_modalities)):
+                    raise ValueError(
+                        "Cannot build speaker prompt. "
+                        "There should be one and only one out of codec or codec_ssl "
+                        "modality in the task tempalte. "
+                )
+                
+                if "codec_ssl" in all_modalities:
+                    value = value + self.token_bias["ssl"][0]
+                else:
+                    value = value + self.token_bias["codec"][0]
+
+                if len(value) > self.speaker_prompt_length:
+                    start = random.randint(
+                        0, len(value) - self.speaker_prompt_length - 1
+                    )
+                    value = value[start : start + self.speaker_prompt_length]
+                elif self.pad_speaker_prompt:
+                    pad_len = self.speaker_prompt_length - len(value)
+                    value = np.pad(
+                        value,
+                        ((0, pad_len), (0, 0)),
+                        mode="constant",
+                        constant_values=self.pad,
+                    )
+            
+            elif modality == "codec":
+                value = value + self.token_bias["codec"][0]
+            else:
+                value = value + self.token_bias["ssl"][0]
+            
+            conti_feat = None
+
+        # Other discrete modalities
+        elif modality in ["ssl", "text_bpe", "g2p", "video_ssl", "svs_lb"]:
+
+            if modality in ["text_bpe", "g2p"]:
+                if isinstance(value, str):
+                    try:
+                        value = self.text_cleaner(value)
+                    except:
+                        logging.warning(
+                            f"Failed to apply cleaner to {value}. Make it empty"
+                        )
+                        value = ""
+                    tokenizer = self.bpe if modality == "text_bpe" else self.g2p
+                    value = tokenizer.text2tokens(value)
+                    if modality == "g2p":
+                        value = [f"g2p_{tok}" for tok in value]
+                    value = self.converter.tokens2ids(value)
+                    value = np.array(value)
+
+                else:
+                    # already tokenized offline
+                    assert isinstance(value, np.ndarray)
+                    value = value + self.token_bias[modality][0]
+
+            elif modality in ["ssl", "video_ssl"]:
+                value = value + self.token_bias[modality][0]
+            
+            elif modality in ["svs_lb"]:
+                value = value.split(" ")  # str to token list, no '\n'
+                value = self.converter.tokens2ids(value)
+                value = np.array(value)  # NOTE(yiwen) don't need to add token bias
+            
+            else:
+                raise NotImplementedError
+
+            value = np.pad(
+                np.expand_dims(value, 1),
+                ((0, 0), (0, self.codec_token_in_use - 1)),
+                mode="constant",
+                constant_values=self.pad,
+            )
+
+            conti_feat = None
+
+        # continuous modalities
+        elif modality in ["text_emb", "video_feat"]:
             if value.ndim != 2:
                 raise ValueError(f"Text embedding should have size of [T, D]")
 

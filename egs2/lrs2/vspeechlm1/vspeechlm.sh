@@ -1,0 +1,1 @@
+../../TEMPLATE/vspeechlm1/vspeechlm.sh
